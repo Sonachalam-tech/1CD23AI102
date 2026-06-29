@@ -764,3 +764,159 @@ ON notifications (notification_type, created_at DESC);
 This lets the database jump directly to `Placement` rows and then scan only within the last 7 days, without touching the rest of the table.
 
 
+## Stage 4
+
+### Problem
+
+Every time a student loads any page, the application fetches their notifications from the database. With 50,000 active students, this means tens of thousands of database queries hitting the notifications table simultaneously during peak hours. The database was not designed to serve as a real-time read layer for this volume of concurrent requests. It is getting overwhelmed.
+
+---
+
+### Solution: Layered Performance Strategy
+
+There is no single fix here. The right approach is a combination of strategies applied at different layers. Each is explained below along with its tradeoffs.
+
+---
+
+### Strategy 1: Introduce a Caching Layer (Redis)
+
+**What it does:**
+
+Instead of querying PostgreSQL on every page load, the application first checks Redis for the student's notifications. If the data is there (cache hit), it is returned immediately without touching the database. If not (cache miss), the database is queried and the result is stored in Redis for subsequent requests.
+
+**Implementation approach:**
+
+```
+Page load
+  → Check Redis for key notifications:student:{studentId}
+  → Cache hit: return cached data immediately
+  → Cache miss: query PostgreSQL → store result in Redis with TTL → return data
+```
+
+Set a TTL (time to live) of 60–120 seconds on each cache entry. This means a student's notification list is at most 2 minutes stale, which is acceptable for a notification feed.
+
+When a new notification is created for a student, invalidate that student's cache key so the next request fetches fresh data.
+
+```
+New notification inserted for studentId X
+  → DELETE notifications:student:X from Redis
+```
+
+**Tradeoffs:**
+
+| Benefit | Cost |
+|---|---|
+| Eliminates repeated DB reads for the same student | Cache invalidation logic must be maintained carefully |
+| Response time drops from tens of milliseconds to under 1ms on cache hits | Redis is an additional infrastructure dependency |
+| DB load drops dramatically during peak hours | Stale data window of up to TTL duration |
+| Scales horizontally — Redis handles far more concurrent reads than PostgreSQL | Memory cost — large notification lists for many students consume RAM |
+
+---
+
+### Strategy 2: Pagination — Never Fetch All Notifications at Once
+
+**What it does:**
+
+If the application is loading all notifications for a student on every page load, it is fetching far more data than is visible on screen. No student reads hundreds of notifications at once. The query should be paginated — fetch only what is needed for the current view.
+
+**Implementation approach:**
+
+```
+GET /api/v1/notifications?page=1&limit=20
+```
+
+Each page load fetches only 20 notifications. As the student scrolls or clicks "load more", the next page is fetched. This reduces the data transferred per request and the work done by the database per query.
+
+**Tradeoffs:**
+
+| Benefit | Cost |
+|---|---|
+| Dramatically reduces data transferred per request | Requires frontend to implement pagination or infinite scroll |
+| Database query touches fewer rows per request | Total count query for pagination metadata still hits the DB |
+| Composable with caching — cache individual pages | UX requires thoughtful design to avoid feeling paginated |
+
+---
+
+### Strategy 3: Read Replicas for the Database
+
+**What it does:**
+
+PostgreSQL supports replication. A read replica is a copy of the primary database that receives all writes in real time but handles only read queries. All `SELECT` queries for fetching notifications are routed to the replica. All `INSERT`, `UPDATE`, and `DELETE` operations still go to the primary.
+
+**Implementation approach:**
+
+```
+Write path (insert, update, delete) → Primary PostgreSQL instance
+Read path (fetch notifications)     → Read Replica PostgreSQL instance
+```
+
+**Tradeoffs:**
+
+| Benefit | Cost |
+|---|---|
+| Primary DB is no longer burdened by read traffic | Replication lag — replica may be milliseconds behind primary |
+| Can scale reads by adding more replicas | Additional infrastructure cost |
+| No application logic changes for most queries | Application must be replica-aware (route reads vs writes correctly) |
+| Increases overall availability | If replica falls behind, reads return slightly stale data |
+
+---
+
+### Strategy 4: Unread Count as a Separate Lightweight Query
+
+**What it does:**
+
+The most common reason to check notifications on every page load is to display the unread count badge in the navigation bar. This does not require fetching all notification content — it only needs a number. Instead of running a full notification fetch on every page load, maintain a separate `notification_unread_counts` table as described in Stage 2.
+
+```sql
+SELECT unread_count
+FROM notification_unread_counts
+WHERE student_id = $1;
+```
+
+This is a single-row primary key lookup — essentially free at any scale. The full notification list is only fetched when the student explicitly opens the notification panel.
+
+**Tradeoffs:**
+
+| Benefit | Cost |
+|---|---|
+| Badge count becomes an O(1) primary key lookup | Counter must be incremented on insert and decremented on read |
+| Eliminates the most frequent unnecessary full fetch | Counter can drift out of sync if update logic has a bug |
+| Massive reduction in DB load for the most common operation | Requires careful transaction handling to keep counter accurate |
+
+---
+
+### Strategy 5: Client-Side Caching with Cache-Control Headers
+
+**What it does:**
+
+The API response for notification fetches can include HTTP caching headers that instruct the browser or any intermediate proxy to cache the response for a short period. This prevents the same client from making repeated identical requests within a short window.
+
+```
+Cache-Control: private, max-age=30
+ETag: "abc123"
+```
+
+With an `ETag`, the client sends `If-None-Match: "abc123"` on the next request. If nothing has changed, the server returns `304 Not Modified` with no body — saving bandwidth and skipping the DB query entirely.
+
+**Tradeoffs:**
+
+| Benefit | Cost |
+|---|---|
+| Zero infrastructure cost — just response headers | Only works for identical repeated requests from the same client |
+| Reduces server hits for rapid repeated page loads | Does not help when 50,000 different students each request once |
+| ETags allow efficient freshness checks | ETag generation requires comparing current data state |
+
+---
+
+### Recommended Combined Approach
+
+No single strategy solves this in isolation. The recommended production approach is:
+
+1. **Pagination first** — this is a zero-cost fix that should already be in place. Never fetch more than 20 notifications per request.
+2. **Unread count table** — decouple the badge count from the full notification fetch entirely.
+3. **Redis cache** — cache paginated notification responses per student with a 60-second TTL. Invalidate on new notification creation.
+4. **Read replica** — once the above three are in place and the DB is still under pressure, introduce a read replica to offload remaining read traffic.
+
+This ordering matters. Caching a poorly designed query only delays the problem. Fix the query pattern first, then cache the result.
+
+
