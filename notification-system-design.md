@@ -409,3 +409,232 @@ Used consistently across all endpoints:
 | 422    | Request is valid JSON but fails validation |
 | 500    | Unexpected server error                  |
 
+## Stage 2
+
+### Database Choice: PostgreSQL (Relational SQL)
+
+For this notification platform, I recommend **PostgreSQL** as the persistent storage layer.
+
+#### Why PostgreSQL
+
+The notification data is highly structured — every notification has a fixed set of fields: an ID, a student ID, a type, a message, a read status, and a timestamp. There is no ambiguity about the shape of a notification record. It does not vary from one record to another. This makes a relational schema the natural fit.
+
+Beyond structure, the queries we need to run are relational in nature. We filter by `studentId`. We filter by `isRead`. We filter by `type`. We sort by `createdAt`. We do bulk updates across rows for a given student. These are exactly the kinds of operations that SQL handles efficiently, especially with proper indexes.
+
+PostgreSQL specifically (over plain MySQL) gives us:
+
+- **UUID as a native type** — notification IDs are UUIDs, PostgreSQL stores and indexes them natively
+- **ENUM types** — we can enforce `notification_type` values at the database level
+- **JSONB support** — if metadata needs to be attached to notifications in the future, PostgreSQL handles it without a schema migration
+- **Robust index types** — B-tree, partial indexes, and composite indexes all available
+- **Transactions** — bulk operations like "mark all as read" can be wrapped in a transaction safely
+
+---
+
+### Database Schema
+
+```sql
+-- Enum for notification type
+CREATE TYPE notification_type AS ENUM ('Event', 'Result', 'Placement');
+
+-- Main notifications table
+CREATE TABLE notifications (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  student_id      VARCHAR(100) NOT NULL,
+  type            notification_type NOT NULL,
+  message         VARCHAR(500) NOT NULL,
+  is_read         BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at      TIMESTAMPTZ
+);
+```
+
+---
+
+### Problems That Arise as Data Volume Increases
+
+The platform is for 50,000 students. If each student receives an average of 100 notifications per year, that is 5,000,000 rows per year. In a few years the table will have tens of millions of rows. The problems that emerge at this scale are:
+
+#### 1. Full Table Scans on Unindexed Columns
+
+A query like `WHERE student_id = 'stu_123' AND is_read = false ORDER BY created_at DESC` will do a full sequential scan on a table of millions of rows if there are no indexes. This is the exact query the application runs on every page load for every student.
+
+**Solution: Composite Index**
+
+```sql
+CREATE INDEX idx_notifications_student_unread
+ON notifications (student_id, is_read, created_at DESC);
+```
+
+This index covers the three columns used in the most common query together. PostgreSQL can satisfy the entire WHERE clause and ORDER BY from the index alone without touching the table rows.
+
+#### 2. Counting Unread Notifications is Expensive
+
+Displaying a badge count of unread notifications requires `COUNT(*)` on potentially thousands of rows per student. At scale this becomes slow.
+
+**Solution: Maintain a separate unread count cache table**
+
+```sql
+CREATE TABLE notification_unread_counts (
+  student_id   VARCHAR(100) PRIMARY KEY,
+  unread_count INTEGER NOT NULL DEFAULT 0,
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+```
+
+Increment this counter when a notification is inserted. Decrement when marked as read. This makes the badge count an O(1) lookup instead of a COUNT query.
+
+#### 3. The Table Grows Without Bound
+
+Old read notifications from years ago are still sitting in the table taking up space and slowing down queries.
+
+**Solution: Archival / TTL Policy**
+
+Move notifications older than 90 days that have been read into an `archived_notifications` table, or delete them entirely depending on business requirements. This keeps the hot table small.
+
+```sql
+-- Archive old read notifications (run as a scheduled job)
+INSERT INTO archived_notifications
+SELECT * FROM notifications
+WHERE is_read = TRUE AND created_at < NOW() - INTERVAL '90 days';
+
+DELETE FROM notifications
+WHERE is_read = TRUE AND created_at < NOW() - INTERVAL '90 days';
+```
+
+#### 4. Bulk Inserts for 50,000 Students are Slow Row by Row
+
+Sending a notification to all students one INSERT at a time is extremely slow.
+
+**Solution: Batch INSERT**
+
+```sql
+INSERT INTO notifications (student_id, type, message)
+VALUES
+  ('stu_001', 'Event', 'Tech fest tomorrow'),
+  ('stu_002', 'Event', 'Tech fest tomorrow'),
+  ('stu_003', 'Event', 'Tech fest tomorrow');
+  -- ... all 50,000 in a single statement or chunked batches of 1000
+```
+
+---
+
+### SQL Queries Mapped to Stage 1 REST APIs
+
+---
+
+#### GET /api/v1/notifications — Fetch all notifications for a student (paginated, with optional type filter)
+
+```sql
+-- Without type filter
+SELECT id, student_id, type, message, is_read, created_at
+FROM notifications
+WHERE student_id = $1
+ORDER BY created_at DESC
+LIMIT $2 OFFSET $3;
+
+-- With type filter
+SELECT id, student_id, type, message, is_read, created_at
+FROM notifications
+WHERE student_id = $1
+  AND type = $2
+ORDER BY created_at DESC
+LIMIT $3 OFFSET $4;
+
+-- Total count for pagination
+SELECT COUNT(*)
+FROM notifications
+WHERE student_id = $1;
+```
+
+---
+
+#### GET /api/v1/notifications/:id — Fetch a single notification
+
+```sql
+SELECT id, student_id, type, message, is_read, created_at
+FROM notifications
+WHERE id = $1
+  AND student_id = $2;
+```
+
+The `student_id` check ensures a student cannot fetch another student's notification.
+
+---
+
+#### PATCH /api/v1/notifications/:id/read — Mark a single notification as read
+
+```sql
+UPDATE notifications
+SET is_read = TRUE,
+    updated_at = NOW()
+WHERE id = $1
+  AND student_id = $2
+RETURNING id, is_read, updated_at;
+```
+
+---
+
+#### PATCH /api/v1/notifications/read-all — Mark all notifications as read
+
+```sql
+UPDATE notifications
+SET is_read = TRUE,
+    updated_at = NOW()
+WHERE student_id = $1
+  AND is_read = FALSE;
+```
+
+---
+
+#### POST /api/v1/notifications — Insert a single notification
+
+```sql
+INSERT INTO notifications (student_id, type, message)
+VALUES ($1, $2, $3)
+RETURNING id, student_id, type, message, is_read, created_at;
+```
+
+---
+
+#### POST /api/v1/notifications/bulk — Insert notifications for multiple students
+
+```sql
+INSERT INTO notifications (student_id, type, message)
+SELECT
+  unnest($1::varchar[]),
+  $2::notification_type,
+  $3
+RETURNING id, student_id;
+```
+
+`$1` is the array of student IDs. `$2` is the type. `$3` is the message. PostgreSQL's `unnest` expands the array into individual rows in a single INSERT statement.
+
+---
+
+#### DELETE /api/v1/notifications/:id — Delete a notification
+
+```sql
+DELETE FROM notifications
+WHERE id = $1
+  AND student_id = $2;
+```
+
+---
+
+### Index Summary
+
+```sql
+-- Primary lookup: student's notifications sorted by time
+CREATE INDEX idx_notifications_student_created
+ON notifications (student_id, created_at DESC);
+
+-- Unread filter: used when fetching unread or marking all as read
+CREATE INDEX idx_notifications_student_unread
+ON notifications (student_id, is_read, created_at DESC);
+
+-- Type filter: used when filtering by notification_type
+CREATE INDEX idx_notifications_student_type
+ON notifications (student_id, type, created_at DESC);
+```
+
