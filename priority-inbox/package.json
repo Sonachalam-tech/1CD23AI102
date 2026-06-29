@@ -1,0 +1,16 @@
+{
+  "name": "priority-inbox",
+  "version": "1.0.0",
+  "description": "Priority Inbox — fetches notifications and returns top N by weight and recency",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "top10": "node index.js 10",
+    "top15": "node index.js 15",
+    "top20": "node index.js 20"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0"
+  }
+}
